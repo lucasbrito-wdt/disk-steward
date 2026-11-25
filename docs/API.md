@@ -144,14 +144,15 @@ The shell is responsible for the policy: refuse `set_enabled(.., true)` when `Ta
 | `schedule` | `ScheduleAgent[]` |
 
 Errors go to stderr with exit code 1. `--no-measure` skips the file walk (instant; sizes `0`, `privateBytes: null`).
-Measuring is kernel-bound (about 10 us per file; `~/.cache/uv` and `~/.bun/install` hold 150k-300k files each), so a full
-`overview` on a dev machine takes roughly 10-15 s in a debug build; the UI should fetch with `measure = false` first and
-fill the sizes afterwards. Timings (debug build, 2026-11-24, machine under load average 40+ from other builds, so
-pessimistic): `overview --no-measure` 2.7 s (the `uv-cache` venv scan under `~/dev`; `docker system df` is skipped),
+Measuring is kernel-bound (`~/.cache/uv` and `~/.bun/install` hold 150k-300k files each), so a full `overview` on a
+dev machine takes seconds even in a release build; the UI should fetch with `measure = false` first and fill the sizes
+afterwards. Directory walks use `getattrlistbulk` (type, logical/on-disk sizes, `UF_COMPRESSED` and
+`ATTR_CMNEXT_PRIVATESIZE` per entry in one syscall) instead of per-file `lstat` + `getattrlist`. Timings before that
+change (debug build, 2026-11-24, machine under load average 40+ from other builds, so pessimistic):
+`overview --no-measure` 2.7 s (the `uv-cache` venv scan under `~/dev`; `docker system df` is skipped),
 `measure ~/.bun/install` (304k files) 9 s, full `overview` 42-44 s (the 4 workers per target and one thread per target
-are kernel-bound: `sys` time is 5-10x `user`). `getattrlistbulk` was not tried: the walk is dominated by per-file
-`lstat` + `getattrlist` syscalls and a bulk rewrite is a large unsafe change; the app instead serves the cached overview
-and measures in the background.
+were kernel-bound: `sys` time is 5-10x `user`). The app still serves the cached overview and measures in the
+background.
 
 ## Tauri commands (`src-tauri`)
 

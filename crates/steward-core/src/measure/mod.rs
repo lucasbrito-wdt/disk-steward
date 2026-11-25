@@ -1,7 +1,13 @@
 //! Clone-aware size measurement. `du` counts clones twice; `private_bytes` (getattrlist
 //! ATTR_CMNEXT_PRIVATESIZE) only counts bytes not shared with any other file.
+//!
+//! Directory walks use `getattrlistbulk` so one syscall returns type, sizes and private
+//! bytes for every entry (instead of per-file `lstat` + `getattrlist`).
+
+mod bulk;
 
 use crate::model::Measure;
+use bulk::{DirEnt, FileEnt};
 use globset::GlobSet;
 use std::{
     collections::HashSet,
@@ -22,7 +28,7 @@ use std::{
 
 const WORKERS: usize = 4;
 
-const UF_COMPRESSED: u32 = 0x20; // sys/stat.h
+pub(crate) const UF_COMPRESSED: u32 = 0x20; // sys/stat.h
 // Header values (sys/attr.h): ATTR_CMNEXT_PRIVATESIZE 0x8 (in `forkattr`), FSOPT_ATTR_CMN_EXTENDED 0x20.
 const OPTIONS: u32 = libc::FSOPT_NOFOLLOW | libc::FSOPT_ATTR_CMN_EXTENDED;
 
@@ -38,7 +44,7 @@ pub fn measure_excluding(root: &Path, skip: &GlobSet) -> io::Result<Measure> {
     let seen = Mutex::new(HashSet::new());
     if root_md.is_file() {
         let mut acc = Acc::new(&seen);
-        acc.file(root, &root_md);
+        acc.file_from_meta(root, &root_md);
         return Ok(acc.m);
     }
     let dev = root_md.dev();
@@ -56,7 +62,7 @@ pub fn measure_excluding(root: &Path, skip: &GlobSet) -> io::Result<Measure> {
 }
 
 fn walk(
-    dev: u64,
+    root_dev: u64,
     queue: &Mutex<Vec<PathBuf>>,
     pending: &AtomicUsize,
     seen: &Mutex<HashSet<(u64, u64)>>,
@@ -73,15 +79,36 @@ fn walk(
             continue;
         };
         let mut subdirs = Vec::new();
-        for entry in fs::read_dir(&dir).into_iter().flatten().flatten() {
-            let Ok(md) = entry.metadata() else { continue }; // lstat: never follows symlinks
-            if md.dev() != dev {
-                continue;
+        match bulk::read_dir_bulk(&dir) {
+            Ok(entries) => {
+                for ent in entries {
+                    match ent {
+                        DirEnt::Dir { path, dev } => {
+                            if dev == root_dev {
+                                subdirs.push(path);
+                            }
+                        }
+                        DirEnt::File(f) => {
+                            if f.dev == root_dev && !skip.is_match(&f.path) {
+                                acc.file_ent(f);
+                            }
+                        }
+                    }
+                }
             }
-            if md.is_dir() {
-                subdirs.push(entry.path());
-            } else if md.is_file() && !skip.is_match(entry.path()) {
-                acc.file(&entry.path(), &md);
+            Err(_) => {
+                // Permission / parse / ERANGE: fall back to per-entry lstat + getattrlist.
+                for entry in fs::read_dir(&dir).into_iter().flatten().flatten() {
+                    let Ok(md) = entry.metadata() else { continue };
+                    if md.dev() != root_dev {
+                        continue;
+                    }
+                    if md.is_dir() {
+                        subdirs.push(entry.path());
+                    } else if md.is_file() && !skip.is_match(entry.path()) {
+                        acc.file_from_meta(&entry.path(), &md);
+                    }
+                }
             }
         }
         pending.fetch_add(subdirs.len(), Ordering::SeqCst); // before the parent is released
@@ -116,30 +143,57 @@ impl<'a> Acc<'a> {
         }
     }
 
-    fn file(&mut self, path: &Path, md: &fs::Metadata) {
-        if md.nlink() > 1
-            && !self
-                .seen
-                .lock()
-                .expect("seen lock")
-                .insert((md.dev(), md.ino()))
-        {
-            return; // hardlink already counted
-        }
+    fn file_from_meta(&mut self, path: &Path, md: &fs::Metadata) {
         let on_disk = md.blocks() * 512;
         let compressed = md.st_flags() & UF_COMPRESSED != 0;
-        self.m.total_files += 1;
-        self.m.logical_bytes += md.len();
-        self.m.on_disk_bytes += on_disk;
-        self.m.compressed_files += u64::from(compressed);
-        // The kernel reports 0 private bytes for compressed files (their data sits in the resource
-        // fork / decmpfs xattr, not in the data fork). The engine writes compressed copies fresh
-        // (never clones), so their on-disk size is private.
         let private = if compressed {
             Ok(on_disk)
         } else {
             private_size(path)
         };
+        self.accumulate(
+            md.nlink(),
+            md.dev(),
+            md.ino(),
+            md.len(),
+            on_disk,
+            compressed,
+            private,
+        );
+    }
+
+    fn file_ent(&mut self, f: FileEnt) {
+        self.accumulate(
+            f.nlink,
+            f.dev,
+            f.ino,
+            f.logical,
+            f.on_disk,
+            f.compressed,
+            f.private,
+        );
+    }
+
+    fn accumulate(
+        &mut self,
+        nlink: u64,
+        dev: u64,
+        ino: u64,
+        logical: u64,
+        on_disk: u64,
+        compressed: bool,
+        private: io::Result<u64>,
+    ) {
+        if nlink > 1 && !self.seen.lock().expect("seen lock").insert((dev, ino)) {
+            return; // hardlink already counted
+        }
+        self.m.total_files += 1;
+        self.m.logical_bytes += logical;
+        self.m.on_disk_bytes += on_disk;
+        self.m.compressed_files += u64::from(compressed);
+        // The kernel reports 0 private bytes for compressed files (their data sits in the resource
+        // fork / decmpfs xattr, not in the data fork). The engine writes compressed copies fresh
+        // (never clones), so their on-disk size is private.
         match private {
             Ok(n) => self.m.private_bytes = self.m.private_bytes.map(|p| p + n),
             Err(e) if e.kind() == io::ErrorKind::NotFound => {} // vanished mid-walk
@@ -177,105 +231,4 @@ pub fn private_size(path: &Path) -> io::Result<u64> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::process::Command;
-
-    #[test]
-    fn constants_match_sdk_header() {
-        assert_eq!(libc::ATTR_CMNEXT_PRIVATESIZE, 0x8);
-        assert_eq!(libc::FSOPT_ATTR_CMN_EXTENDED, 0x20);
-        assert_eq!(libc::FSOPT_NOFOLLOW, 0x1);
-        assert_eq!(libc::ATTR_BIT_MAP_COUNT, 5);
-    }
-
-    #[test]
-    fn counts_files_and_skips_symlinks() {
-        let t = tempfile::tempdir().unwrap();
-        fs::create_dir(t.path().join("d")).unwrap();
-        fs::write(t.path().join("d/a"), vec![1u8; 10_000]).unwrap();
-        fs::write(t.path().join("b"), vec![2u8; 5_000]).unwrap();
-        std::os::unix::fs::symlink(t.path().join("d"), t.path().join("link")).unwrap();
-        fs::hard_link(t.path().join("b"), t.path().join("b2")).unwrap();
-        let m = measure(t.path()).unwrap();
-        assert_eq!(
-            (m.total_files, m.logical_bytes, m.compressed_files),
-            (2, 15_000, 0)
-        );
-        assert!(m.on_disk_bytes >= 15_000);
-    }
-
-    #[test]
-    fn excluded_paths_are_not_measured() {
-        let t = tempfile::tempdir().unwrap();
-        let env = t.path().join("archive-v0/h1/lib/python3.13");
-        fs::create_dir_all(&env).unwrap();
-        fs::create_dir_all(t.path().join("archive-v0/wheel")).unwrap();
-        let data: Vec<u8> = (0..4_194_304u32)
-            .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
-            .collect();
-        fs::write(env.join("orig"), &data).unwrap();
-        let cloned = Command::new("cp")
-            .arg("-c")
-            .arg(env.join("orig"))
-            .arg(env.join("clone"))
-            .status()
-            .unwrap();
-        if !cloned.success() {
-            eprintln!("SKIP: cp -c failed (temp dir is not on APFS?)");
-            return;
-        }
-        fs::write(t.path().join("archive-v0/wheel/mod.py"), "x = 1").unwrap();
-        let all = measure(t.path()).unwrap();
-        assert!(
-            all.private_bytes.unwrap() < all.on_disk_bytes,
-            "clones must show as shared"
-        );
-        let mut skip = globset::GlobSetBuilder::new();
-        let pat = format!("{}/archive-v0/*/lib/python*/**", t.path().display());
-        skip.add(
-            globset::GlobBuilder::new(&pat)
-                .literal_separator(true)
-                .build()
-                .unwrap(),
-        );
-        let m = measure_excluding(t.path(), &skip.build().unwrap()).unwrap();
-        assert_eq!(m.total_files, 1);
-        assert_eq!(m.private_bytes, Some(m.on_disk_bytes));
-    }
-
-    #[test]
-    fn clone_has_smaller_private_size_than_on_disk() {
-        let t = tempfile::tempdir().unwrap();
-        // Incompressible-ish content so allocation is plain 4 MiB.
-        let data: Vec<u8> = (0..4_194_304u32)
-            .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
-            .collect();
-        fs::write(t.path().join("orig"), &data).unwrap();
-        let cloned = Command::new("cp")
-            .arg("-c")
-            .arg(t.path().join("orig"))
-            .arg(t.path().join("clone"))
-            .status()
-            .unwrap();
-        if !cloned.success() {
-            eprintln!("SKIP: cp -c failed (temp dir is not on APFS?)");
-            return;
-        }
-        let m = measure(t.path()).unwrap();
-        let private = m.private_bytes.expect("private size supported");
-        assert!(
-            private < m.on_disk_bytes,
-            "private {private} vs on disk {}",
-            m.on_disk_bytes
-        );
-        // After un-sharing, a plain copy is fully private.
-        fs::write(
-            t.path().join("unique"),
-            data.iter().rev().copied().collect::<Vec<_>>(),
-        )
-        .unwrap();
-        let alone = measure(&t.path().join("unique")).unwrap();
-        assert_eq!(alone.private_bytes, Some(alone.on_disk_bytes));
-    }
-}
+mod tests;

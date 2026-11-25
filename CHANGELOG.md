@@ -6,6 +6,11 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Changed
+
+- Measurement walks directories with `getattrlistbulk` (one syscall for names, sizes and
+  `ATTR_CMNEXT_PRIVATESIZE`) instead of per-file `lstat` + `getattrlist`.
+
 ## [0.1.0] - 2026-11-24
 
 First public release.
